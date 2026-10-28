@@ -9,8 +9,8 @@ window.APP_CONFIG = {
     // Die echte App: gilt nur auf den hier eingetragenen Adressen.
     live: {
       hosts: ["DEIN-NAME.github.io"],
-      supabaseUrl: "",
-      supabaseAnonKey: ""
+      supabaseUrl: "https://gtoihxapryxssuvztusx.supabase.co",
+      supabaseAnonKey: "sb_publishable_8iNNaDNNysBdnyIWBN2mWg_S8zp5PDh"
     },
     // Testumgebung: gilt überall sonst (Cloudflare-Vorschau, lokal geöffnet).
     // Leer lassen = Demo-Modus.
