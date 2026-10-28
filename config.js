@@ -8,7 +8,7 @@ window.APP_CONFIG = {
   environments: {
     // Die echte App: gilt nur auf den hier eingetragenen Adressen.
     live: {
-      hosts: ["DEIN-NAME.github.io"],
+      hosts: ["wutend159.github.io"],
       supabaseUrl: "https://wcmbnmuaqqynoyauxets.supabase.co",
       supabaseAnonKey: "sb_publishable_rRimPfc5gIbKW3p9t10nJg_zhgavZKL"
     },
