@@ -4,7 +4,17 @@
    Konfiguration & Konstanten
    ========================================================================= */
 const CFG = window.APP_CONFIG || {};
-const DEMO = !(CFG.supabaseUrl && CFG.supabaseAnonKey);
+// Umgebung wählen: «live» auf den eingetragenen Adressen, sonst «test» (z.B. Cloudflare-Vorschau oder lokal).
+const ENV = (() => {
+  const envs = CFG.environments;
+  if (!envs) return CFG.supabaseUrl ? { name: 'live', supabaseUrl: CFG.supabaseUrl, supabaseAnonKey: CFG.supabaseAnonKey } : null;
+  const host = location.hostname;
+  if (envs.live && (envs.live.hosts || []).includes(host) && envs.live.supabaseUrl) return { name: 'live', ...envs.live };
+  if (envs.test && envs.test.supabaseUrl) return { name: 'test', ...envs.test };
+  return null;
+})();
+const DEMO = !(ENV && ENV.supabaseUrl && ENV.supabaseAnonKey);
+const LOGIN_DOMAIN = CFG.loginDomain || 'scm2.invalid';
 const TEAM = CFG.teamName || 'Aufstellung';
 const INITIAL = CFG.initialPlayers || {};
 
@@ -76,6 +86,12 @@ function toast(msg) {
   toast._t = setTimeout(() => t.classList.remove('show'), 2600);
 }
 const emailName = e => (e || '').split('@')[0];
+const myProfile = () => st.data?.profiles?.find(p => p.user_id === st.user?.id) || null;
+function userName(id, email) {
+  const pr = id && st.data?.profiles?.find(p => p.user_id === id);
+  return pr ? (pr.display_name || pr.username) : emailName(email);
+}
+const isPlaceholderMail = e => !e || e.toLowerCase().endsWith('@' + LOGIN_DOMAIN.toLowerCase());
 const nullDate = v => (v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
 
 /* =========================================================================
@@ -85,7 +101,7 @@ const PLAYER_DEFAULTS = {
   sp_user_id: null, sp_name: '', sp_roles: '', first_name: '', last_name: '', nickname: '', positions: [],
   role: 'spieler', out_kind: null, out_title: '', out_from: null, out_until: null, is_guest: false, active: true
 };
-const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups'];
+const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups', 'profiles'];
 
 function makeLocalApi() {
   const KEY = 'aufstellung-demo-v2';
@@ -101,7 +117,14 @@ function makeLocalApi() {
     save(); return clone(i >= 0 ? db[table][i] : row);
   };
   return {
-    async session() { return { email: 'demo@lokal' }; },
+    async session() {
+      if (!db.profiles.length) { db.profiles.push({ user_id: 'demo', username: 'demo', display_name: 'Demo Coach', player_id: null }); save(); }
+      return { email: 'demo@lokal', id: 'demo' };
+    },
+    async updateProfile(fields) {
+      if (fields.username && db.profiles.some(p => p.username === fields.username && p.user_id !== 'demo')) throw new Error('Dieser Benutzername ist schon vergeben.');
+      return upsertBy('profiles', x => x.user_id === 'demo', fields);
+    },
     async signIn() {}, async signOut() {},
     async isCoach() { return true; },
     async changePassword() { throw new Error('Im Demo-Modus gibt es kein Passwort.'); },
@@ -147,18 +170,36 @@ function makeLocalApi() {
       save();
     },
     async saveLineup(l) {
-      const row = { event_id: l.event_id, title: l.title, data: l.data, updated_by_email: 'demo@lokal', updated_at: now() };
+      const row = { event_id: l.event_id, title: l.title, data: l.data, updated_by_email: 'demo@lokal', updated_by: 'demo', updated_at: now() };
       if (l.id) return upsertBy('lineups', x => x.id === l.id, row);
-      const n = { ...row, id: uid(), created_by_email: 'demo@lokal', created_at: now() }; db.lineups.push(n); save(); return clone(n);
+      const n = { ...row, id: uid(), created_by_email: 'demo@lokal', created_by: 'demo', created_at: now() }; db.lineups.push(n); save(); return clone(n);
     },
     async deleteLineup(id) { db.lineups = db.lineups.filter(l => l.id !== id); save(); }
   };
 }
 
+// Unsichtbare Zeichen (Zeilenumbrüche, Leerzeichen) aus kopierten Werten entfernen
+const SB_URL = String(ENV?.supabaseUrl || '').trim().replace(/\/+$/, '');
+const SB_KEY = String(ENV?.supabaseAnonKey || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
+function keyProblem() {
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(SB_URL)) return 'Die supabaseUrl in config.js hat nicht die Form https://xxxx.supabase.co';
+  if (SB_KEY.startsWith('sb_secret_')) return 'In config.js steht der geheime «secret»-Schlüssel. Bitte den «publishable» bzw. «anon public» Schlüssel verwenden.';
+  if (/^eyJ/.test(SB_KEY)) {
+    try {
+      const role = JSON.parse(atob(SB_KEY.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).role;
+      if (role === 'service_role') return 'In config.js steht der «service_role»-Schlüssel. Bitte den «anon public» Schlüssel verwenden.';
+    } catch { return 'Der Schlüssel in config.js ist unvollständig. Bitte nochmals vollständig kopieren.'; }
+  } else if (!SB_KEY.startsWith('sb_publishable_')) return 'Der Schlüssel in config.js sieht nicht wie ein Supabase-Schlüssel aus.';
+  return null;
+}
+const netMsg = err => (/load failed|failed to fetch|networkerror/i.test(err?.message || '')
+  ? 'Keine Verbindung zu Supabase. Prüfe in config.js die URL und den Schlüssel (vollständig, ohne Leerzeichen).'
+  : err?.message || String(err));
+
 function makeSupabaseApi() {
-  const sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey);
-  const chk = ({ data, error }) => { if (error) throw new Error(error.message); return data; };
-  let email = null;
+  const sb = window.supabase.createClient(SB_URL, SB_KEY);
+  const chk = ({ data, error }) => { if (error) throw new Error(netMsg(error)); return data; };
+  let email = null, userId = null;
   async function all(table) {
     const out = []; const step = 1000;
     for (let from = 0; ; from += step) {
@@ -171,12 +212,26 @@ function makeSupabaseApi() {
     async session() {
       const { data } = await sb.auth.getSession();
       email = data.session?.user?.email || null;
-      return data.session ? { email } : null;
+      userId = data.session?.user?.id || null;
+      return data.session ? { email, id: userId } : null;
     },
-    async signIn(e, p) {
-      const { data, error } = await sb.auth.signInWithPassword({ email: e, password: p });
-      if (error) throw new Error(/invalid/i.test(error.message) ? 'E-Mail oder Passwort ist falsch.' : error.message);
-      email = data.user.email;
+    async signIn(ident, p) {
+      ident = ident.trim();
+      let mail = ident;
+      if (!ident.includes('@')) { // Benutzername → E-Mail
+        const { data, error } = await sb.rpc('login_email', { p_username: ident.toLowerCase() }).then(r => r, err => ({ error: err }));
+        if (error) throw new Error(netMsg(error));
+        if (!data) throw new Error('Benutzername oder Passwort ist falsch.');
+        mail = data;
+      }
+      const { data, error } = await sb.auth.signInWithPassword({ email: mail, password: p }).catch(err => ({ error: err }));
+      if (error) throw new Error(/invalid login/i.test(error.message) ? 'Benutzername oder Passwort ist falsch.' : netMsg(error));
+      email = data.user.email; userId = data.user.id;
+    },
+    async updateProfile(fields) {
+      const { data, error } = await sb.from('profiles').update(fields).eq('user_id', userId).select().single();
+      if (error) throw new Error(/duplicate|unique/i.test(error.message) ? 'Dieser Benutzername ist schon vergeben.' : /check/i.test(error.message) ? 'Der Benutzername darf nur Kleinbuchstaben, Zahlen, Punkt, Bindestrich und Unterstrich enthalten (2–30 Zeichen).' : netMsg(error));
+      return data;
     },
     async signOut() { await sb.auth.signOut(); },
     async isCoach() { return !!chk(await sb.rpc('is_coach')); },
@@ -217,7 +272,7 @@ function makeSupabaseApi() {
       else chk(await sb.from('training_cancellations').delete().eq('date', date));
     },
     async saveLineup(l) {
-      const row = { event_id: l.event_id, title: l.title, data: l.data, updated_by_email: email, updated_at: new Date().toISOString() };
+      const row = { event_id: l.event_id, title: l.title, data: l.data, updated_by_email: email, updated_by: userId, updated_at: new Date().toISOString() };
       if (l.id) return chk(await sb.from('lineups').update(row).eq('id', l.id).select().single());
       return chk(await sb.from('lineups').insert(row).select().single());
     },
@@ -225,7 +280,8 @@ function makeSupabaseApi() {
   };
 }
 
-const api = DEMO ? makeLocalApi() : makeSupabaseApi();
+const SETUP_PROBLEM = DEMO ? null : keyProblem() || (window.supabase ? null : 'Die Supabase-Bibliothek konnte nicht geladen werden. Prüfe die Internetverbindung oder deaktiviere einen Inhaltsblocker für diese Seite.');
+const api = DEMO ? makeLocalApi() : SETUP_PROBLEM ? null : makeSupabaseApi();
 
 /* =========================================================================
    Zustand
@@ -429,9 +485,10 @@ function renderShell() {
     <header class="top">
       <div class="top-row">
         <div class="brand">${esc(TEAM)}</div>
+        ${ENV?.name === 'test' ? '<span class="env-badge" title="Testumgebung mit Testdatenbank">TEST</span>' : ''}
         <div class="who">
-          <span title="${esc(st.user.email)}">${esc(st.user.email)}</span>
-          ${DEMO ? '' : '<button class="btn ghost small" data-act="pw">Passwort</button><button class="btn ghost small" data-act="logout">Abmelden</button>'}
+          <button class="btn ghost small" data-act="tab" data-tab="account" title="Konto">👤 ${esc(userName(st.user.id, st.user.email))}</button>
+          ${DEMO ? '' : '<button class="btn ghost small" data-act="logout">Abmelden</button>'}
         </div>
       </div>
       <nav class="tabs" role="tablist">${TABS.map(([k, l]) =>
@@ -445,7 +502,7 @@ function renderView() {
   document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === st.tab)));
   const v = $('#view');
   if (!v) return;
-  const views = { lineup: () => (st.draft ? editorHtml() : lineupHomeHtml()), presence: presenceHtml, players: playersHtml, trainings: trainingsHtml, import: importHtml };
+  const views = { lineup: () => (st.draft ? editorHtml() : lineupHomeHtml()), presence: presenceHtml, players: playersHtml, trainings: trainingsHtml, import: importHtml, account: accountHtml };
   v.innerHTML = views[st.tab]();
 }
 
@@ -502,7 +559,7 @@ function lineupHomeHtml() {
         <div>${miniPitch(l.data || {})}
           <h3>${esc(l.title || 'Ohne Titel')}</h3>
           <div class="small muted">${esc(l.data?.formation || '')}, ${(l.data?.slots || []).filter(Boolean).length}/11 besetzt</div>
-          <div class="small muted">Von ${esc(emailName(l.created_by_email))}${l.updated_at ? `, geändert ${esc(fmtStamp(l.updated_at))}` : ''}${l.updated_by_email && l.updated_by_email !== l.created_by_email ? ` von ${esc(emailName(l.updated_by_email))}` : ''}</div>
+          <div class="small muted">Von ${esc(userName(l.created_by, l.created_by_email))}${l.updated_at ? `, geändert ${esc(fmtStamp(l.updated_at))}` : ''}${l.updated_by_email && l.updated_by_email !== l.created_by_email ? ` von ${esc(userName(l.updated_by, l.updated_by_email))}` : ''}</div>
         </div>
         <div class="row">
           <button class="btn small primary" data-act="open-lineup" data-id="${l.id}">Öffnen</button>
@@ -516,7 +573,7 @@ function lineupHomeHtml() {
 function newDraft(game, base) {
   return {
     id: null, event_id: game.id,
-    title: base ? `${base.title} (Kopie)` : `Aufstellung ${emailName(st.user.email)}`,
+    title: base ? `${base.title} (Kopie)` : `Aufstellung ${userName(st.user.id, st.user.email)}`,
     data: base ? clone(base.data) : { formation: DEFAULT_FORMATION, slots: Array(11).fill(null), bench: [], extra: [] }
   };
 }
@@ -1143,6 +1200,42 @@ function addPlayerDialog() {
     <div class="dlg-foot"><button class="btn left" data-act="new-guest">Neuen Gastspieler erfassen</button><button class="btn" data-act="close">Fertig</button></div>`);
 }
 
+function accountHtml() {
+  const pr = myProfile();
+  const linked = pr?.player_id ? st.pmap.get(pr.player_id) : null;
+  const people = st.data.players.filter(p => p.active && !p.is_guest).sort(byName);
+  if (!pr) {
+    return `<div class="panel empty"><h2>Kein Profil</h2><p>Für dieses Konto ist noch kein Benutzername eingerichtet. Der Admin kann das in Supabase mit <code>add_coach</code> nachholen (siehe README). Anmelden geht bis dahin mit der E-Mail-Adresse.</p></div>`;
+  }
+  return `
+    <h2 style="margin-bottom:1rem">Konto</h2>
+    <div class="account-grid">
+      <form class="panel form-stack" data-form="profile">
+        <h3>Profil</h3>
+        <label class="field">Name<input class="input" name="display_name" value="${esc(pr.display_name)}" autocomplete="name" placeholder="z.B. Cédric Mouchous"></label>
+        <label class="field">Benutzername<input class="input" name="username" value="${esc(pr.username)}" autocomplete="username" autocapitalize="none" spellcheck="false" required pattern="[a-z0-9._\-]{2,30}">
+          <span class="small muted" style="font-weight:400">Zum Anmelden. Kleinbuchstaben, Zahlen, Punkt, Bindestrich, Unterstrich.</span></label>
+        <div class="field">E-Mail
+          <div class="readonly">${isPlaceholderMail(st.user.email) ? '<span class="muted">keine hinterlegt</span>' : esc(st.user.email)}</div>
+          <span class="small muted" style="font-weight:400">Wird vom Admin in Supabase geändert.</span></div>
+        <label class="field">Ich in der Spielerliste
+          <select class="select" name="player_id"><option value="">Nicht verknüpft</option>${people.map(p => `<option value="${p.id}" ${pr.player_id === p.id ? 'selected' : ''}>${esc(displayName(p))}${p.sp_name && p.sp_name !== displayName(p) ? ` (${esc(p.sp_name)})` : ''}</option>`).join('')}</select>
+          <span class="small muted" style="font-weight:400">${linked ? `Verknüpft mit ${esc(displayName(linked))}.` : 'Verknüpft dein Konto mit deinem Eintrag als Spieler oder Trainer.'}</span></label>
+        <p class="error" hidden></p>
+        <div><button class="btn primary" type="submit">Profil speichern</button></div>
+      </form>
+      <form class="panel form-stack" data-form="pw">
+        <h3>Passwort ändern</h3>
+        <input type="text" name="username" value="${esc(pr.username)}" autocomplete="username" hidden>
+        <label class="field">Neues Passwort<input class="input" type="password" name="pw" minlength="8" required autocomplete="new-password"></label>
+        <label class="field">Wiederholen<input class="input" type="password" name="pw2" minlength="8" required autocomplete="new-password"></label>
+        <p class="error" hidden></p>
+        <div><button class="btn primary" type="submit">Passwort ändern</button></div>
+      </form>
+    </div>
+    ${DEMO ? '' : '<div class="section"><button class="btn" data-act="logout">Abmelden</button></div>'}`;
+}
+
 function passwordDialog() {
   openDialog(`
     <form method="dialog" data-form="pw">
@@ -1609,12 +1702,20 @@ document.addEventListener('submit', e => {
     e.preventDefault();
     const fd = new FormData(f);
     if (fd.get('pw') !== fd.get('pw2')) return fail('Die beiden Passwörter stimmen nicht überein.');
-    guarded(async () => { await api.changePassword(fd.get('pw')); closeDialog(); toast('Passwort geändert.'); });
+    guarded(async () => { await api.changePassword(fd.get('pw')); closeDialog(); f.reset?.(); toast('Passwort geändert.'); });
+  } else if (f.dataset.form === 'profile') {
+    e.preventDefault();
+    const fd = new FormData(f);
+    const username = String(fd.get('username') || '').trim().toLowerCase();
+    if (!/^[a-z0-9._-]{2,30}$/.test(username)) return fail('Der Benutzername darf nur Kleinbuchstaben, Zahlen, Punkt, Bindestrich und Unterstrich enthalten (2–30 Zeichen).');
+    api.updateProfile({ username, display_name: String(fd.get('display_name') || '').trim(), player_id: fd.get('player_id') || null })
+      .then(async () => { await reload(); renderShell(); toast('Profil gespeichert.'); })
+      .catch(err => fail(err.message));
   } else if (f.dataset.form === 'login') {
     e.preventDefault();
     const fd = new FormData(f); const b = $('button', f);
     b.disabled = true; er.hidden = true;
-    api.signIn(fd.get('email').trim(), fd.get('password'))
+    api.signIn(String(fd.get('email')), fd.get('password'))
       .then(start)
       .catch(err => { fail(err.message); b.disabled = false; });
   }
@@ -1662,7 +1763,7 @@ function loginHtml() {
   return `<div class="login"><form class="panel" data-form="login">
     <h1>${esc(TEAM)}</h1>
     <p class="muted" style="margin:0">Aufstellungen für das Trainerteam. Melde dich mit deinem Coach-Konto an.</p>
-    <label class="field">E-Mail<input class="input" type="email" name="email" required autocomplete="username"></label>
+    <label class="field">Benutzername<input class="input" type="text" name="email" required autocomplete="username" autocapitalize="none" spellcheck="false"></label>
     <label class="field">Passwort<input class="input" type="password" name="password" required autocomplete="current-password"></label>
     <p class="error" hidden></p>
     <button class="btn primary" type="submit">Anmelden</button>
@@ -1670,6 +1771,12 @@ function loginHtml() {
 }
 
 async function start() {
+  const kp = SETUP_PROBLEM;
+  if (kp) {
+    $('#app').innerHTML = `<div class="login"><div class="panel"><h1>Einstellung prüfen</h1><p>${esc(kp)}</p>
+      <p class="small muted">Zu finden in Supabase unter Project Settings → API Keys.</p></div></div>`;
+    return;
+  }
   try {
     st.user = await api.session();
     if (!st.user) { $('#app').innerHTML = loginHtml(); return; }
