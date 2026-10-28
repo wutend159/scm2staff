@@ -101,7 +101,7 @@ const PLAYER_DEFAULTS = {
   sp_user_id: null, sp_name: '', sp_roles: '', first_name: '', last_name: '', nickname: '', positions: [],
   role: 'spieler', out_kind: null, out_title: '', out_from: null, out_until: null, is_guest: false, active: true
 };
-const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups', 'profiles'];
+const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups', 'profiles', 'fixtures', 'league_table', 'results', 'sync_log'];
 
 function makeLocalApi() {
   const KEY = 'aufstellung-demo-v2';
@@ -174,7 +174,8 @@ function makeLocalApi() {
       if (l.id) return upsertBy('lineups', x => x.id === l.id, row);
       const n = { ...row, id: uid(), created_by_email: 'demo@lokal', created_by: 'demo', created_at: now() }; db.lineups.push(n); save(); return clone(n);
     },
-    async deleteLineup(id) { db.lineups = db.lineups.filter(l => l.id !== id); save(); }
+    async deleteLineup(id) { db.lineups = db.lineups.filter(l => l.id !== id); save(); },
+    async upsertFixtures(rows) { for (const r of rows) upsertBy('fixtures', x => x.match_no === r.match_no, r); }
   };
 }
 
@@ -276,7 +277,8 @@ function makeSupabaseApi() {
       if (l.id) return chk(await sb.from('lineups').update(row).eq('id', l.id).select().single());
       return chk(await sb.from('lineups').insert(row).select().single());
     },
-    async deleteLineup(id) { chk(await sb.from('lineups').delete().eq('id', id)); }
+    async deleteLineup(id) { chk(await sb.from('lineups').delete().eq('id', id)); },
+    async upsertFixtures(rows) { if (rows.length) chk(await sb.from('fixtures').upsert(rows, { onConflict: 'match_no' })); }
   };
 }
 
@@ -327,6 +329,7 @@ async function reload() {
     st.ovr.get(x.event_id).set(x.player_id, x.present);
     if (x.present) join(x.player_id, evDate.get(x.event_id));
   }
+  mergeFixtures();
   st.sessions = buildSessions();
 }
 
@@ -674,7 +677,11 @@ function lineupHomeHtml() {
           ${game.time_meet ? `<span>Treffpunkt ${esc(fmtTime(game.time_meet))}</span>` : ''}
           ${venue ? `<span>📍 <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(venue)}" target="_blank" rel="noopener">${esc(venue)}</a></span>` : ''}
           <span>${ups.length} zugesagt</span>
+          ${game._fx?.status && !/noch nicht ausgetragen/i.test(game._fx.status) ? `<span class="md-badge">${esc(game._fx.status)}</span>` : ''}
         </div>
+        ${(() => { const r = ourResult(game); if (!r) return ''; const o = outcome(r, OUR_TEAM);
+          return `<div class="md-result"><strong>${o.f}:${o.a}</strong> ${{ S: 'Sieg', U: 'Unentschieden', N: 'Niederlage' }[o.res]}</div>`; })()}
+        ${game._auto?.length ? `<div class="md-auto small">${esc(game._auto.join(', '))} aus dem Verbands-Spielplan</div>` : ''}
         <div id="wx" class="md-wx">${weatherHtml(st.weather.get(`${game.id}|${game.date}|${game.time_start}|${game.home_away}|${game.venue}`))}</div>
       </div>
       <button class="btn small md-edit" data-act="game-info">Spielinfos</button>
@@ -716,6 +723,7 @@ function lineupHomeHtml() {
         </div>
         ${prev ? '<p class="small muted">Übernimmt Formation, Startelf und Bank vom letzten Spiel. Wer nicht zugesagt hat, wird automatisch entfernt.</p>' : ''}
       </section>`}
+    ${leagueHtml(game)}
     ${CFG.ifvWidgetUrl ? `<details class="section ifv" ${lsGet('ifvOpen', false) ? 'open' : ''} data-on="ifv-toggle">
       <summary><h2>Tabelle und Resultate</h2></summary>
       <iframe src="${esc(CFG.ifvWidgetUrl)}" title="Tabelle und Resultate (football.ch)" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
@@ -745,6 +753,111 @@ function gameInfoDialog() {
       </div>
       <div class="dlg-foot"><button type="button" class="btn" data-act="close">Abbrechen</button><button class="btn primary" type="submit">Speichern</button></div>
     </form>`);
+}
+
+/* ---------- Liga-Daten (Spielplan, Tabelle, Resultate) ---------- */
+const OUR_TEAM = CFG.leagueTeamName || 'SC Menzingen II';
+const LEAGUE_GROUP = CFG.leagueGroup || 'Gruppe 3';
+const normTeam = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const isUs = n => normTeam(n) === normTeam(OUR_TEAM);
+const cleanVenue = v => String(v || '').replace(/\s+-\s+.*$/, '').trim();
+// Ergänzt Spiele aus SpielerPlus mit Gegner, Ort und Zeit aus dem Verbands-Spielplan (nur leere Felder).
+function mergeFixtures() {
+  for (const e of st.data.events) {
+    if (e.kind !== 'spiel') continue;
+    const fx = (st.data.fixtures || []).find(f => f.date === e.date && (isUs(f.home) || isUs(f.away)));
+    e._fx = fx || null; e._auto = [];
+    if (!fx) continue;
+    const home = isUs(fx.home);
+    if (!e.opponent) { e.opponent = home ? fx.away : fx.home; e._auto.push('Gegner'); }
+    if (!e.home_away) { e.home_away = home ? 'heim' : 'auswaerts'; e._auto.push('Heim/Auswärts'); }
+    if (!e.venue && fx.venue) { e.venue = cleanVenue(fx.venue); e._auto.push('Ort'); }
+    if (!e.time_start && fx.time) { e.time_start = fx.time; e._auto.push('Anpfiff'); }
+  }
+}
+const teamResults = team => (st.data.results || []).filter(r => normTeam(r.home) === normTeam(team) || normTeam(r.away) === normTeam(team))
+  .sort((a, b) => b.date.localeCompare(a.date));
+function outcome(r, team) {
+  const h = normTeam(r.home) === normTeam(team);
+  const f = h ? r.home_goals : r.away_goals, a = h ? r.away_goals : r.home_goals;
+  return { f, a, res: f > a ? 'S' : f < a ? 'N' : 'U', opp: h ? r.away : r.home, home: h };
+}
+const ourResult = game => (st.data.results || []).find(r => r.date === game.date && (isUs(r.home) || isUs(r.away)));
+const FORM_DE = { W: 'S', D: 'U', L: 'N' };
+const formChips = letters => `<span class="form">${[...letters].map(c => `<span class="fc fc-${FORM_DE[c] || c}" title="${{ S: 'Sieg', U: 'Unentschieden', N: 'Niederlage' }[FORM_DE[c] || c] || ''}">${FORM_DE[c] || c}</span>`).join('')}</span>`;
+const resLine = (r, team) => {
+  const o = outcome(r, team);
+  return `<li><span class="fc fc-${o.res}">${o.res}</span> <span class="muted small">${esc(fmtDate(r.date, false))}</span> ${o.home ? '' : '@ '}${esc(o.opp)} <strong>${o.f}:${o.a}</strong></li>`;
+};
+function leagueHtml(game) {
+  const lt = (st.data.league_table || []).find(x => x.group_name === LEAGUE_GROUP);
+  const rows = lt?.rows || [];
+  const opp = game.opponent;
+  const oppRow = rows.find(r => normTeam(r.team) === normTeam(opp));
+  const oppRes = opp ? teamResults(opp).filter(r => !(r.date === game.date && (isUs(r.home) || isUs(r.away)))).slice(0, 5) : [];
+  const h2h = opp ? teamResults(OUR_TEAM).filter(r => normTeam(r.home) === normTeam(opp) || normTeam(r.away) === normTeam(opp)) : [];
+  const next = (st.data.fixtures || []).filter(f => f.date >= todayIso() && (isUs(f.home) || isUs(f.away))).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 3);
+  const log = [...(st.data.sync_log || [])].sort((a, b) => (b.ran_at || '').localeCompare(a.ran_at || ''))[0];
+  if (!rows.length && !oppRes.length && !h2h.length && !next.length) return '';
+  return `
+    <section class="section league">
+      <div class="league-grid">
+        ${rows.length ? `<div class="panel">
+          <h3>Tabelle ${esc(LEAGUE_GROUP)}</h3>
+          <div class="table-wrap"><table class="lt">
+            <thead><tr><th>#</th><th>Team</th><th class="num">Sp</th><th class="num">Diff</th><th class="num">Pkt</th><th>Form</th></tr></thead>
+            <tbody>${rows.map(r => `<tr class="${isUs(r.team) ? 'us' : normTeam(r.team) === normTeam(opp) ? 'opp' : ''}">
+              <td>${r.rank}</td><td>${esc(r.team)}</td><td class="num">${r.sp}</td><td class="num">${r.diff > 0 ? '+' : ''}${r.diff}</td><td class="num"><strong>${r.pkt}</strong></td><td>${formChips(r.form || '')}</td></tr>`).join('')}</tbody>
+          </table></div>
+        </div>` : ''}
+        <div class="panel opp-panel">
+          ${opp ? `<h3>Gegner: ${esc(opp)}</h3>
+          ${oppRow ? `<p class="opp-rank"><strong>${oppRow.rank}.</strong> mit ${oppRow.pkt} Punkten, Tore ${oppRow.t}:${oppRow.gt} ${oppRow.form ? formChips(oppRow.form) : ''}</p>` : ''}
+          <h4>Letzte Resultate</h4>
+          ${oppRes.length ? `<ul class="res">${oppRes.map(r => resLine(r, opp)).join('')}</ul>` : '<p class="small muted">Noch keine gespeichert. Sie sammeln sich mit jedem Abruf.</p>'}
+          <h4>Direktvergleich</h4>
+          ${h2h.length ? `<ul class="res">${h2h.map(r => resLine(r, OUR_TEAM)).join('')}</ul>` : '<p class="small muted">Noch keine Duelle gespeichert.</p>'}`
+          : '<p class="muted">Gegner noch nicht bekannt.</p>'}
+          ${next.length ? `<h4>Nächste Spiele laut Verband</h4><ul class="res">${next.map(f => `<li><span class="muted small">${esc(fmtDate(f.date, true, false))}${f.time ? ' ' + esc(fmtTime(f.time)) : ''}</span> ${isUs(f.home) ? 'gegen' : '@'} ${esc(isUs(f.home) ? f.away : f.home)}${f.status && !/noch nicht ausgetragen/i.test(f.status) ? ` <span class="badge warn">${esc(f.status)}</span>` : ''}</li>`).join('')}</ul>` : ''}
+        </div>
+      </div>
+      ${log ? `<p class="small ${log.ok ? 'muted' : 'error'}">${log.ok ? 'Liga-Daten' : 'Letzter Abruf mit Problemen'}: Stand ${esc(fmtStamp(log.ran_at))}${log.ok ? '' : ` (${esc(log.message)})`}. Quellen: IFV-Spielplan, footstats.ch.</p>` : ''}
+    </section>`;
+}
+
+/* ---------- Spielplan-Import von Hand (ICS oder CSV vom IFV) ---------- */
+function parseIcsClient(text) {
+  const lines = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '').split('\n');
+  const out = []; let ev = null;
+  const un = v => v.replace(/\\n/gi, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';');
+  for (const line of lines) {
+    if (line === 'BEGIN:VEVENT') { ev = {}; continue; }
+    if (line === 'END:VEVENT') { if (ev) out.push(ev); ev = null; continue; }
+    if (!ev) continue;
+    const i = line.indexOf(':'); if (i < 0) continue;
+    ev[line.slice(0, i).split(';')[0].toUpperCase()] = un(line.slice(i + 1));
+  }
+  return out.map(e => {
+    const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/.exec(e.DTSTART || '');
+    if (!m) return null;
+    const [home, away] = (e.SUMMARY || '').split(/\s+-\s+/).map(t => t.replace(/\s*\(\d+\.?\)\s*$/, '').trim());
+    const desc = (e.DESCRIPTION || '').split('\n').map(x => x.trim()).filter(Boolean);
+    const nr = (desc.join(' ').match(/Spielnummer\s+(\d+)/) || [])[1] || (e.UID || '').split('@')[0];
+    const idx = desc.findIndex(x => /^Spielnummer/.test(x));
+    const status = idx >= 0 && desc[idx + 1] && !/^https?:/.test(desc[idx + 1]) ? desc[idx + 1] : '';
+    return { match_no: String(nr), date: `${m[1]}-${m[2]}-${m[3]}`, time: `${m[4]}:${m[5]}` === '00:00' ? '' : `${m[4]}:${m[5]}:00`,
+      home: home || '', away: away || '', venue: (e.LOCATION || '').trim(), status, competition: desc.slice(0, 2).join(' ').replace(/\s+/g, ' ') };
+  }).filter(Boolean);
+}
+function parseIfvCsv(rows) {
+  return rows.filter(r => r.Spielnummer && r.Spieldatum).map(r => ({
+    match_no: r.Spielnummer, date: spDate(r.Spieldatum), time: r.Spielzeit ? r.Spielzeit.slice(0, 5) + ':00' : '',
+    home: r['Teamname A'] || '', away: r['Teamname B'] || '', venue: r.Spielort || '', status: '', competition: `${r.SpielTyp || ''} ${r.Bezeichnung || ''}`.replace(/\s+/g, ' ').trim()
+  })).filter(r => r.date);
+}
+async function readText(file) {
+  const buf = await file.arrayBuffer();
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return new TextDecoder('windows-1252').decode(buf); }
 }
 
 function draftFromPrevious(game) {
@@ -1486,9 +1599,13 @@ const TYPE_MAP = { training: 'training', game: 'spiel', tournament: 'spiel', eve
 
 async function handleFiles(files) {
   const evMap = new Map(); const problems = [];
+  const fixtures = [];
   for (const file of files) {
-    let rows;
-    try { rows = parseCsv(await file.text()); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    let rows, text;
+    try { text = await readText(file); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    if (/^\uFEFF?BEGIN:VCALENDAR/.test(text)) { fixtures.push(...parseIcsClient(text)); continue; }
+    try { rows = parseCsv(text); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    if (rows.length && 'Spielnummer' in rows[0] && 'Teamname A' in rows[0]) { fixtures.push(...parseIfvCsv(rows)); continue; }
     const stats = rows.length && 'user_participation' in rows[0];
     if (!rows.length || !('user_id' in rows[0]) || !('event_date_start' in rows[0])) {
       problems.push(`${file.name}: sieht nicht wie ein Export aus SpielerPlus aus.`); continue;
@@ -1510,6 +1627,12 @@ async function handleFiles(files) {
         status: stats ? (STATUS_MAP[r.user_participation] || 'none') : 'yes'
       });
     }
+  }
+  if (fixtures.length) {
+    await api.upsertFixtures(fixtures.map(f => ({ ...f, updated_at: new Date().toISOString() })));
+    await reload();
+    toast(`${fixtures.length} Spiele aus dem Verbands-Spielplan übernommen.`);
+    if (!evMap.size && !problems.length) { st.preview = null; renderView(); return; }
   }
   const events = [...evMap.values()].sort((a, b) => a.date.localeCompare(b.date));
   st.preview = { events, problems };
@@ -1567,9 +1690,9 @@ function importHtml() {
   return `
     <h2 style="margin-bottom:.75rem">CSV aus SpielerPlus importieren</h2>
     <label class="drop" data-drop="files">
-      <strong>CSV-Dateien hier ablegen oder auswählen</strong>
-      <span class="small muted">Termin-Export (wöchentlich) oder Statistik-Export (gelegentlich, mit Absagen). Mehrere Dateien gehen auch. Ein bereits importierter Termin wird mit dem neuen Stand ersetzt; von Hand gesetzte Häkchen bleiben erhalten.</span>
-      <input type="file" accept=".csv,text/csv" multiple data-on="files" style="position:absolute;opacity:0;width:1px;height:1px">
+      <strong>Dateien hier ablegen oder auswählen</strong>
+      <span class="small muted">SpielerPlus: Termin-Export (wöchentlich) oder Statistik-Export (gelegentlich, mit Absagen). Verband: Spielplan als Kalender (.ics) oder CSV, falls der automatische Abruf mal nicht klappt. Mehrere Dateien gehen auch. Ein bereits importierter Termin wird mit dem neuen Stand ersetzt; von Hand gesetzte Häkchen bleiben erhalten.</span>
+      <input type="file" accept=".csv,text/csv,.ics,text/calendar" multiple data-on="files" style="position:absolute;opacity:0;width:1px;height:1px">
     </label>
     ${pv ? `<div class="section">
       ${pv.problems.map(p => `<p class="error">${esc(p)}</p>`).join('')}
