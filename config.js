@@ -8,6 +8,10 @@ window.APP_CONFIG = {
   // Heimplatz (für Wetter und Karte)
   homeLocation: { name: "Chrüzegg, Menzingen", lat: 47.1777, lon: 8.5917 },
 
+// Liga-Daten (für Spielplan-Abgleich, Tabelle und Resultate)
+  leagueTeamName: "SC Menzingen II",
+  leagueGroup: "Gruppe 3",
+  
   // Offizielles Club-Widget von football.ch (Resultate + Rangliste), leer = ausgeblendet
   ifvWidgetUrl: "",
   
