@@ -1,0 +1,26 @@
+name: Liga-Daten
+
+on:
+  schedule:
+    - cron: '17 4 * * *'   # täglich um 05:17 (Winter) bzw. 06:17 (Sommer) Schweizer Zeit
+  workflow_dispatch:        # «Run workflow» von Hand, Branch wählbar
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Spielplan, Tabelle und Resultate holen
+        run: node scripts/liga-sync.mjs
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_URL_TEST: ${{ secrets.SUPABASE_URL_TEST }}
+          SUPABASE_SERVICE_KEY_TEST: ${{ secrets.SUPABASE_SERVICE_KEY_TEST }}
