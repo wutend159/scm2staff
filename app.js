@@ -155,27 +155,9 @@ function makeLocalApi() {
   };
 }
 
-// Unsichtbare Zeichen (Zeilenumbrüche, Leerzeichen) aus kopierten Werten entfernen
-const SB_URL = String(CFG.supabaseUrl || '').trim().replace(/\/+$/, '');
-const SB_KEY = String(CFG.supabaseAnonKey || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
-function keyProblem() {
-  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(SB_URL)) return 'Die supabaseUrl in config.js hat nicht die Form https://xxxx.supabase.co';
-  if (SB_KEY.startsWith('sb_secret_')) return 'In config.js steht der geheime «secret»-Schlüssel. Bitte den «publishable» bzw. «anon public» Schlüssel verwenden.';
-  if (/^eyJ/.test(SB_KEY)) {
-    try {
-      const role = JSON.parse(atob(SB_KEY.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).role;
-      if (role === 'service_role') return 'In config.js steht der «service_role»-Schlüssel. Bitte den «anon public» Schlüssel verwenden.';
-    } catch { return 'Der Schlüssel in config.js ist unvollständig. Bitte nochmals vollständig kopieren.'; }
-  } else if (!SB_KEY.startsWith('sb_publishable_')) return 'Der Schlüssel in config.js sieht nicht wie ein Supabase-Schlüssel aus.';
-  return null;
-}
-const netMsg = err => (/load failed|failed to fetch|networkerror/i.test(err?.message || '')
-  ? 'Keine Verbindung zu Supabase. Prüfe in config.js die URL und den Schlüssel (vollständig, ohne Leerzeichen).'
-  : err?.message || String(err));
-
 function makeSupabaseApi() {
-  const sb = window.supabase.createClient(SB_URL, SB_KEY);
-  const chk = ({ data, error }) => { if (error) throw new Error(netMsg(error)); return data; };
+  const sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey);
+  const chk = ({ data, error }) => { if (error) throw new Error(error.message); return data; };
   let email = null;
   async function all(table) {
     const out = []; const step = 1000;
@@ -192,8 +174,8 @@ function makeSupabaseApi() {
       return data.session ? { email } : null;
     },
     async signIn(e, p) {
-      const { data, error } = await sb.auth.signInWithPassword({ email: e, password: p }).catch(err => ({ error: err }));
-      if (error) throw new Error(/invalid login/i.test(error.message) ? 'E-Mail oder Passwort ist falsch.' : netMsg(error));
+      const { data, error } = await sb.auth.signInWithPassword({ email: e, password: p });
+      if (error) throw new Error(/invalid/i.test(error.message) ? 'E-Mail oder Passwort ist falsch.' : error.message);
       email = data.user.email;
     },
     async signOut() { await sb.auth.signOut(); },
@@ -243,8 +225,7 @@ function makeSupabaseApi() {
   };
 }
 
-const SETUP_PROBLEM = DEMO ? null : keyProblem() || (window.supabase ? null : 'Die Supabase-Bibliothek konnte nicht geladen werden. Prüfe die Internetverbindung oder deaktiviere einen Inhaltsblocker für diese Seite.');
-const api = DEMO ? makeLocalApi() : SETUP_PROBLEM ? null : makeSupabaseApi();
+const api = DEMO ? makeLocalApi() : makeSupabaseApi();
 
 /* =========================================================================
    Zustand
@@ -1689,12 +1670,6 @@ function loginHtml() {
 }
 
 async function start() {
-  const kp = SETUP_PROBLEM;
-  if (kp) {
-    $('#app').innerHTML = `<div class="login"><div class="panel"><h1>Einstellung prüfen</h1><p>${esc(kp)}</p>
-      <p class="small muted">Zu finden in Supabase unter Project Settings → API Keys.</p></div></div>`;
-    return;
-  }
   try {
     st.user = await api.session();
     if (!st.user) { $('#app').innerHTML = loginHtml(); return; }
