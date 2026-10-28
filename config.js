@@ -4,7 +4,7 @@
 // Die Daten bleiben dann nur in deinem Browser.
 
 window.APP_CONFIG = {
-  supabaseUrl: "https://supabase.com/dashboard/project/wcmbnmuaqqynoyauxets/",      // z.B. "https://abcdefgh.supabase.co"
+  supabaseUrl: "https://wcmbnmuaqqynoyauxets.supabase.co",      // z.B. "https://abcdefgh.supabase.co"
   supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndjbWJubXVhcXF5bm95YXV4ZXRzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxMTA2NDksImV4cCI6MjEwODY4NjY0OX0.fUD25xv7ion2IlHBMX05oo-wMz0mVJpzmd5Y2CmK6ss",  // der lange "anon public" Schlüssel
   teamName: "SCM II",   // wird oben in der App und im Bild angezeigt
 
