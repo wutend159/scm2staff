@@ -21,8 +21,8 @@ window.APP_CONFIG = {
     // Testumgebung: gilt überall sonst (Cloudflare-Vorschau, lokal geöffnet).
     // Leer lassen = Demo-Modus.
     test: {
-      supabaseUrl: "",
-      supabaseAnonKey: ""
+      supabaseUrl: "https://gtoihxapryxssuvztusx.supabase.co",
+      supabaseAnonKey: "sb_publishable_8iNNaDNNysBdnyIWBN2mWg_S8zp5PDh"
     }
   },
 
