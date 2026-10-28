@@ -10,6 +10,10 @@ window.APP_CONFIG = {
 
   // Offizielles Club-Widget von football.ch (Resultate + Rangliste), leer = ausgeblendet
   ifvWidgetUrl: "",
+
+// Liga-Daten (für Spielplan-Abgleich, Tabelle und Resultate)
+  leagueTeamName: "SC Menzingen II",
+  leagueGroup: "Gruppe 3",
   
   environments: {
     // Die echte App: gilt nur auf den hier eingetragenen Adressen.
