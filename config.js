@@ -5,6 +5,16 @@ window.APP_CONFIG = {
   teamName: "SCM II",            // wird oben in der App und im Bild angezeigt
   loginDomain: "scm2.invalid",   // Platzhalter-Adressen für Logins ohne echte E-Mail
 
+  // Heimplatz (für Wetter und Karte)
+  homeLocation: { name: "Chrüzegg, Menzingen", lat: 47.1777, lon: 8.5917 },
+
+// Liga-Daten (für Spielplan-Abgleich, Tabelle und Resultate)
+  leagueTeamName: "SC Menzingen II",
+  leagueGroup: "Gruppe 3",
+  
+  // Offizielles Club-Widget von football.ch (Resultate + Rangliste), leer = ausgeblendet
+  ifvWidgetUrl: "",
+  
   environments: {
     // Die echte App: gilt nur auf den hier eingetragenen Adressen.
     live: {

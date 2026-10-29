@@ -101,7 +101,7 @@ const PLAYER_DEFAULTS = {
   sp_user_id: null, sp_name: '', sp_roles: '', first_name: '', last_name: '', nickname: '', positions: [],
   role: 'spieler', out_kind: null, out_title: '', out_from: null, out_until: null, is_guest: false, active: true
 };
-const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups', 'profiles'];
+const TABLES = ['players', 'events', 'participations', 'attendance_overrides', 'training_periods', 'training_cancellations', 'lineups', 'profiles', 'fixtures', 'league_table', 'results', 'sync_log'];
 
 function makeLocalApi() {
   const KEY = 'aufstellung-demo-v2';
@@ -145,7 +145,7 @@ function makeLocalApi() {
     async upsertEvent(ev) {
       const e = db.events.find(x => x.sp_key === ev.sp_key);
       if (e) { Object.assign(e, ev); save(); return clone(e); }
-      const n = { team_name: '', name: '', time_start: '', time_meet: '', opponent: '', ...ev, id: uid(), created_at: now() };
+      const n = { team_name: '', name: '', time_start: '', time_meet: '', opponent: '', home_away: '', venue: '', ...ev, id: uid(), created_at: now() };
       db.events.push(n); save(); return clone(n);
     },
     async updateEvent(id, fields) { return upsertBy('events', x => x.id === id, fields); },
@@ -174,7 +174,8 @@ function makeLocalApi() {
       if (l.id) return upsertBy('lineups', x => x.id === l.id, row);
       const n = { ...row, id: uid(), created_by_email: 'demo@lokal', created_by: 'demo', created_at: now() }; db.lineups.push(n); save(); return clone(n);
     },
-    async deleteLineup(id) { db.lineups = db.lineups.filter(l => l.id !== id); save(); }
+    async deleteLineup(id) { db.lineups = db.lineups.filter(l => l.id !== id); save(); },
+    async upsertFixtures(rows) { for (const r of rows) upsertBy('fixtures', x => x.match_no === r.match_no, r); }
   };
 }
 
@@ -276,7 +277,8 @@ function makeSupabaseApi() {
       if (l.id) return chk(await sb.from('lineups').update(row).eq('id', l.id).select().single());
       return chk(await sb.from('lineups').insert(row).select().single());
     },
-    async deleteLineup(id) { chk(await sb.from('lineups').delete().eq('id', id)); }
+    async deleteLineup(id) { chk(await sb.from('lineups').delete().eq('id', id)); },
+    async upsertFixtures(rows) { if (rows.length) chk(await sb.from('fixtures').upsert(rows, { onConflict: 'match_no' })); }
   };
 }
 
@@ -327,6 +329,7 @@ async function reload() {
     st.ovr.get(x.event_id).set(x.player_id, x.present);
     if (x.present) join(x.player_id, evDate.get(x.event_id));
   }
+  mergeFixtures();
   st.sessions = buildSessions();
 }
 
@@ -526,6 +529,124 @@ function miniPitch(data) {
     `<i class="${data.slots?.[i] ? '' : 'e'}" style="left:${x}%;top:${y}%"></i>`).join('')}</div>`;
 }
 
+/* =========================================================================
+   Spieltag: Spielinfos, Wetter, Warnungen, Hauptaufstellung
+   ========================================================================= */
+const HOME = CFG.homeLocation || { name: 'Chrüzegg, Menzingen', lat: 47.1777, lon: 8.5917 };
+const lineupsOf = gameId => st.data.lineups.filter(l => l.event_id === gameId)
+  .sort((a, b) => (b.data?.final === true) - (a.data?.final === true) || (a.created_at || '').localeCompare(b.created_at || ''));
+const isFinal = l => l?.data?.final === true;
+function gameTitle(game) {
+  const opp = game.opponent || 'Gegner offen';
+  return game.home_away === 'auswaerts' ? `${opp} – ${TEAM}` : `${TEAM} – ${opp}`;
+}
+function previousLineup(game) {
+  const prev = games().filter(g => g.date < game.date).reverse();
+  for (const g of prev) { const l = lineupsOf(g.id)[0]; if (l) return { game: g, lineup: l }; }
+  return null;
+}
+
+// Warnungen für ein Spiel (und optional eine Aufstellung)
+function gameWarnings(game, data) {
+  const w = [];
+  const ids = new Set(signedUp(game.id).map(p => p.id));
+  for (const id of data?.extra || []) ids.add(id);
+  const avail = [...ids].map(id => st.pmap.get(id)).filter(Boolean);
+  const n = avail.length;
+  if (n < 11) w.push({ lvl: 'bad', text: `Nur ${n} Spieler verfügbar, für 11 fehlen ${11 - n}.` });
+  else if (n < 14) w.push({ lvl: 'warn', text: `Knappes Kader: ${n} Spieler, also ${n - 11} Wechsel.` });
+  if (!avail.some(p => (p.positions || []).includes('TW'))) w.push({ lvl: 'bad', text: 'Kein Torhüter zugesagt.' });
+  const noPos = avail.filter(p => !(p.positions || []).length);
+  if (noPos.length) w.push({ lvl: 'info', text: `Ohne Position: ${noPos.map(displayName).join(', ')}.` });
+  if (data) {
+    const f = FORMATIONS[data.formation] || FORMATIONS[DEFAULT_FORMATION];
+    const placed = (data.slots || []).filter(Boolean);
+    if (placed.length < 11) w.push({ lvl: 'warn', text: `${11 - placed.length} Position${11 - placed.length === 1 ? '' : 'en'} noch frei.` });
+    const gone = [...placed, ...(data.bench || [])].filter(id => !ids.has(id)).map(id => st.pmap.get(id)).filter(Boolean);
+    if (gone.length) w.push({ lvl: 'bad', text: `Nicht mehr zugesagt: ${gone.map(displayName).join(', ')}.` });
+    const wrong = (data.slots || []).map((id, i) => [st.pmap.get(id), f[i][0]]).filter(([p, pos]) => p && posTier(p, pos) === 2);
+    if (wrong.length) w.push({ lvl: 'warn', text: `Nicht auf ihrer Position: ${wrong.map(([p, pos]) => `${shortName(p)} (${pos})`).join(', ')}.` });
+    const bench = (data.bench || []).map(id => st.pmap.get(id)).filter(Boolean);
+    if (bench.length && !bench.some(p => ['IV', 'LV', 'RV', 'DM'].some(pos => posTier(p, pos) === 0 || posTier(p, pos) === 1)))
+      w.push({ lvl: 'info', text: 'Kein Abwehrspieler auf der Bank.' });
+  }
+  return w;
+}
+function warningsHtml(w) {
+  if (!w.length) return '';
+  const order = { bad: 0, warn: 1, info: 2 };
+  w = [...w].sort((a, b) => order[a.lvl] - order[b.lvl]);
+  const icon = { bad: '⛔', warn: '⚠️', info: 'ℹ️' };
+  return `<ul class="warns">${w.map(x => `<li class="w-${x.lvl}"><span aria-hidden="true">${icon[x.lvl]}</span> ${esc(x.text)}</li>`).join('')}</ul>`;
+}
+
+// Wetter (Open-Meteo, ohne Schlüssel)
+const WMO = { 0: ['☀️', 'sonnig'], 1: ['🌤️', 'meist sonnig'], 2: ['⛅', 'teils bewölkt'], 3: ['☁️', 'bedeckt'], 45: ['🌫️', 'Nebel'], 48: ['🌫️', 'Nebel'],
+  51: ['🌦️', 'Niesel'], 53: ['🌦️', 'Niesel'], 55: ['🌦️', 'Niesel'], 56: ['🌧️', 'gefrierender Niesel'], 57: ['🌧️', 'gefrierender Niesel'],
+  61: ['🌧️', 'leichter Regen'], 63: ['🌧️', 'Regen'], 65: ['🌧️', 'starker Regen'], 66: ['🌧️', 'Eisregen'], 67: ['🌧️', 'Eisregen'],
+  71: ['🌨️', 'leichter Schnee'], 73: ['🌨️', 'Schnee'], 75: ['❄️', 'starker Schnee'], 77: ['🌨️', 'Schneegriesel'],
+  80: ['🌦️', 'Regenschauer'], 81: ['🌧️', 'Regenschauer'], 82: ['⛈️', 'heftige Schauer'], 85: ['🌨️', 'Schneeschauer'], 86: ['🌨️', 'Schneeschauer'],
+  95: ['⛈️', 'Gewitter'], 96: ['⛈️', 'Gewitter mit Hagel'], 99: ['⛈️', 'Gewitter mit Hagel'] };
+st.weather = new Map();
+async function geocode(text) {
+  const key = 'geo:' + text.toLowerCase();
+  const cached = lsGet(key, null); if (cached) return cached;
+  const parts = [text, ...text.split(/[,/-]/).map(s => s.trim()).reverse(), ...text.split(/\s+/)].filter(s => s.length > 2);
+  for (const q of [...new Set(parts)]) {
+    try {
+      const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=1&language=de&countryCode=CH`);
+      const j = await r.json();
+      if (j.results?.length) { const g = { name: j.results[0].name, lat: j.results[0].latitude, lon: j.results[0].longitude }; lsSet(key, g); return g; }
+    } catch { /* weiter versuchen */ }
+  }
+  return null;
+}
+async function loadWeather(game) {
+  const k = `${game.id}|${game.date}|${game.time_start}|${game.home_away}|${game.venue}`;
+  if (st.weather.has(k)) return st.weather.get(k);
+  st.weather.set(k, { loading: true });
+  let res;
+  try {
+    const days = (utc(game.date) - utc(todayIso())) / 864e5;
+    if (days < 0) res = { none: true };
+    else if (days > 15) res = { later: true, days: Math.ceil(days - 15) };
+    else {
+      const loc = game.home_away === 'auswaerts' ? (game.venue ? await geocode(game.venue) : null) : HOME;
+      if (!loc) res = { noloc: true };
+      else {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&hourly=temperature_2m,precipitation_probability,weather_code,wind_speed_10m&timezone=Europe%2FZurich&start_date=${game.date}&end_date=${game.date}`;
+        const j = await (await fetch(url)).json();
+        const hour = parseInt((game.time_start || '15:00').slice(0, 2), 10);
+        const i = Math.min(j.hourly.time.length - 1, Math.max(0, hour));
+        res = { at: game.time_start ? 'zum Anpfiff' : 'um 15 Uhr', loc: loc.name, temp: Math.round(j.hourly.temperature_2m[i]), rain: j.hourly.precipitation_probability?.[i], code: j.hourly.weather_code[i], wind: Math.round(j.hourly.wind_speed_10m[i]) };
+      }
+    }
+  } catch { res = { error: true }; }
+  st.weather.set(k, res);
+  return res;
+}
+function weatherHtml(w) {
+  if (!w || w.loading) return '<span class="muted small">Wetter wird geladen …</span>';
+  if (w.none) return '';
+  if (w.later) return `<span class="muted small">Wetterprognose in ${w.days} Tag${w.days === 1 ? '' : 'en'} verfügbar.</span>`;
+  if (w.noloc) return '<span class="muted small">Für das Wetter den Spielort eintragen.</span>';
+  if (w.error) return '<span class="muted small">Wetter gerade nicht verfügbar.</span>';
+  const [ic, txt] = WMO[w.code] || ['🌡️', ''];
+  return `<span class="wx"><span class="wx-ic" aria-hidden="true">${ic}</span><strong>${w.temp}°</strong> ${esc(txt)}${w.rain != null ? `, Regen ${w.rain}%` : ''}, Wind ${w.wind} km/h <span class="muted small">(${esc(w.loc)}, ${w.at})</span></span>`;
+}
+function refreshWeather(game) {
+  loadWeather(game).then(w => { const el = $('#wx'); if (el && st.gameId === game.id) el.innerHTML = weatherHtml(w); });
+}
+
+// Statische Feld-Vorschau
+function pitchPreview(data) {
+  const f = FORMATIONS[data.formation] || FORMATIONS[DEFAULT_FORMATION];
+  return `<div class="pitch static" aria-label="Aufstellung ${esc(data.formation)}">${pitchLines()}${f.map(([pos, x, y], i) => {
+    const p = st.pmap.get(data.slots?.[i]);
+    return `<div class="slot${p ? ' filled' : ''}" style="left:${x}%;top:${y}%"><div class="disc">${esc(pos)}</div>${p ? `<div class="lbl">${esc(shortName(p))}</div>` : ''}</div>`;
+  }).join('')}</div>`;
+}
+
 function lineupHomeHtml() {
   const g = games();
   if (!g.length) {
@@ -536,45 +657,227 @@ function lineupHomeHtml() {
   if (!st.gameId || !eventById(st.gameId)) st.gameId = defaultGameId();
   const game = eventById(st.gameId);
   const ups = signedUp(game.id);
-  const lus = st.data.lineups.filter(l => l.event_id === game.id).sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  const lus = lineupsOf(game.id);
+  const main = lus[0];
+  const variants = lus.slice(1);
   const t = todayIso();
+  const prev = previousLineup(game);
+  setTimeout(() => refreshWeather(game), 0);
+  const venue = game.home_away === 'auswaerts' ? game.venue : (game.venue || HOME.name);
   return `
-    <div class="game-head">
-      <div>
-        <div class="when">${esc(fmtDate(game.date))}</div>
-        <div class="facts">${esc(game.name)}${game.time_start ? `, Anpfiff ${esc(fmtTime(game.time_start))}` : ''}${game.time_meet ? `, Treffpunkt ${esc(fmtTime(game.time_meet))}` : ''}</div>
-        <div class="facts">${ups.length} zugesagt</div>
-      </div>
-      <label class="field game-pick">Gegner (optional)
-        <input class="input" data-on="opponent" value="${esc(game.opponent || '')}" placeholder="z.B. FC Beispiel" autocomplete="off"></label>
-      <label class="field game-pick">Spiel
-        <select class="select" data-on="game">${g.map(e =>
-          `<option value="${e.id}" ${e.id === game.id ? 'selected' : ''}>${esc(fmtDate(e.date))}${e.time_start ? ', ' + esc(fmtTime(e.time_start)) : ''}${e.opponent ? ': ' + esc(e.opponent) : ''}${e.date < t ? ' (vorbei)' : ''}</option>`).join('')}</select>
-      </label>
+    <div class="toolbar">
+      <select class="select game-select" data-on="game" aria-label="Spiel wählen">${g.map(e =>
+        `<option value="${e.id}" ${e.id === game.id ? 'selected' : ''}>${esc(fmtDate(e.date))}${e.opponent ? ': ' + esc(e.opponent) : ''}${e.date < t ? ' (vorbei)' : ''}</option>`).join('')}</select>
     </div>
-    <div class="toolbar"><h2 class="grow">Aufstellungen</h2>
-      <button class="btn primary" data-act="new-lineup">Neue Aufstellung</button></div>
-    ${lus.length ? `<div class="lineup-list">${lus.map(l => `
-      <article class="lu-card">
-        <div>${miniPitch(l.data || {})}
-          <h3>${esc(l.title || 'Ohne Titel')}</h3>
-          <div class="small muted">${esc(l.data?.formation || '')}, ${(l.data?.slots || []).filter(Boolean).length}/11 besetzt</div>
-          <div class="small muted">Von ${esc(userName(l.created_by, l.created_by_email))}${l.updated_at ? `, geändert ${esc(fmtStamp(l.updated_at))}` : ''}${l.updated_by_email && l.updated_by_email !== l.created_by_email ? ` von ${esc(userName(l.updated_by, l.updated_by_email))}` : ''}</div>
+    <section class="matchday">
+      <div class="md-main">
+        <div class="md-date">${esc(fmtDate(game.date))}${game.time_start ? ` · ${esc(fmtTime(game.time_start))}` : ''}</div>
+        <h2 class="md-title">${esc(gameTitle(game))}</h2>
+        <div class="md-facts">
+          ${game.time_meet ? `<span>Treffpunkt ${esc(fmtTime(game.time_meet))}</span>` : ''}
+          ${venue ? `<span>📍 <a href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(venue)}" target="_blank" rel="noopener">${esc(venue)}</a></span>` : ''}
+          <span>${ups.length} zugesagt</span>
+          ${game._fx?.status && !/noch nicht ausgetragen/i.test(game._fx.status) ? `<span class="md-badge">${esc(game._fx.status)}</span>` : ''}
         </div>
-        <div class="row">
-          <button class="btn small primary" data-act="open-lineup" data-id="${l.id}">Öffnen</button>
-          <button class="btn small" data-act="dup-lineup" data-id="${l.id}">Duplizieren</button>
+        ${(() => { const r = ourResult(game); if (!r) return ''; const o = outcome(r, OUR_TEAM);
+          return `<div class="md-result"><strong>${o.f}:${o.a}</strong> ${{ S: 'Sieg', U: 'Unentschieden', N: 'Niederlage' }[o.res]}</div>`; })()}
+        ${game._auto?.length ? `<div class="md-auto small">${esc(game._auto.join(', '))} aus dem Verbands-Spielplan</div>` : ''}
+        <div id="wx" class="md-wx">${weatherHtml(st.weather.get(`${game.id}|${game.date}|${game.time_start}|${game.home_away}|${game.venue}`))}</div>
+      </div>
+      <button class="btn small md-edit" data-act="game-info">Spielinfos</button>
+    </section>
+    ${warningsHtml(gameWarnings(game, main?.data))}
+    ${main ? `
+      <section class="lu-main">
+        <div class="lu-main-head">
+          <div><h2>${esc(main.title || 'Aufstellung')}</h2>
+            <div class="small muted">${esc(main.data?.formation || '')} · von ${esc(userName(main.created_by, main.created_by_email))}${main.updated_at ? `, geändert ${esc(fmtStamp(main.updated_at))}` : ''}</div></div>
+          ${isFinal(main) ? '<span class="final-badge">✓ Definitiv</span>' : '<span class="draft-badge">Entwurf</span>'}
+        </div>
+        <div class="lu-main-body">
+          ${pitchPreview(main.data || {})}
+          <div class="lu-main-side">
+            <h3>Ersatzbank</h3>
+            <p>${(main.data?.bench || []).map(id => st.pmap.get(id)).filter(Boolean).map(p => esc(displayName(p))).join(', ') || '<span class="muted">leer</span>'}</p>
+            <div class="row">
+              <button class="btn primary" data-act="open-lineup" data-id="${main.id}">Bearbeiten</button>
+              <button class="btn" data-act="dup-lineup" data-id="${main.id}">Variante erstellen</button>
+            </div>
+          </div>
+        </div>
+      </section>
+      ${variants.length ? `<section class="section"><h3>Varianten</h3><div class="variant-list">${variants.map(l => `
+        <div class="variant">
+          ${miniPitch(l.data || {})}
+          <div class="grow"><strong>${esc(l.title || 'Variante')}</strong>
+            <div class="small muted">${esc(l.data?.formation || '')} · von ${esc(userName(l.created_by, l.created_by_email))}</div></div>
+          <button class="btn small" data-act="open-lineup" data-id="${l.id}">Öffnen</button>
           <button class="btn small ghost danger" data-act="del-lineup" data-id="${l.id}">Löschen</button>
+        </div>`).join('')}</div></section>` : ''}`
+    : `
+      <section class="panel lu-start">
+        <h2>Aufstellung erstellen</h2>
+        <div class="row">
+          ${prev ? `<button class="btn primary" data-act="from-prev">Letzte übernehmen <span class="small">(${esc(fmtDate(prev.game.date, false, false))}${prev.game.opponent ? ' gegen ' + esc(prev.game.opponent) : ''})</span></button>` : ''}
+          <button class="btn ${prev ? '' : 'primary'}" data-act="new-lineup">Leer beginnen</button>
         </div>
-      </article>`).join('')}</div>`
-      : `<div class="panel empty"><p>Für dieses Spiel gibt es noch keine Aufstellung.</p></div>`}`;
+        ${prev ? '<p class="small muted">Übernimmt Formation, Startelf und Bank vom letzten Spiel. Wer nicht zugesagt hat, wird automatisch entfernt.</p>' : ''}
+      </section>`}
+    ${leagueHtml(game)}
+    ${CFG.ifvWidgetUrl ? `<details class="section ifv" ${lsGet('ifvOpen', false) ? 'open' : ''} data-on="ifv-toggle">
+      <summary><h2>Tabelle und Resultate</h2></summary>
+      <iframe src="${esc(CFG.ifvWidgetUrl)}" title="Tabelle und Resultate (football.ch)" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+      <p class="small muted">Daten: football.ch / IFV (offizielles Club-Widget).</p>
+    </details>` : ''}`;
+}
+
+function gameInfoDialog() {
+  const game = eventById(st.gameId);
+  openDialog(`
+    <form method="dialog" data-form="game">
+      <div class="dlg-head"><h2>Spielinfos</h2><button type="button" class="x" data-act="close" aria-label="Schliessen">×</button></div>
+      <div class="dlg-body">
+        <label class="field">Gegner<input class="input" name="opponent" value="${esc(game.opponent || '')}" placeholder="z.B. FC Meggen III" autocomplete="off"></label>
+        <div class="field">Heim oder auswärts
+          <div class="kind-pick">
+            <label class="kind-opt"><input type="radio" name="home_away" value="heim" ${game.home_away !== 'auswaerts' ? 'checked' : ''}><span>🏠 Heim</span></label>
+            <label class="kind-opt"><input type="radio" name="home_away" value="auswaerts" ${game.home_away === 'auswaerts' ? 'checked' : ''}><span>🚌 Auswärts</span></label>
+          </div></div>
+        <label class="field">Spielort <span class="small muted" style="font-weight:400">bei Heimspielen leer lassen = ${esc(HOME.name)}</span>
+          <input class="input" name="venue" value="${esc(game.venue || '')}" placeholder="z.B. Ebnet, Küssnacht" autocomplete="off"></label>
+        <div class="grid2">
+          <label class="field">Anpfiff<input class="input" type="time" name="time_start" value="${esc(fmtTime(game.time_start))}"></label>
+          <label class="field">Treffpunkt<input class="input" type="time" name="time_meet" value="${esc(fmtTime(game.time_meet))}"></label>
+        </div>
+        <p class="error" hidden></p>
+      </div>
+      <div class="dlg-foot"><button type="button" class="btn" data-act="close">Abbrechen</button><button class="btn primary" type="submit">Speichern</button></div>
+    </form>`);
+}
+
+/* ---------- Liga-Daten (Spielplan, Tabelle, Resultate) ---------- */
+const OUR_TEAM = CFG.leagueTeamName || 'SC Menzingen II';
+const LEAGUE_GROUP = CFG.leagueGroup || 'Gruppe 3';
+const normTeam = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const isUs = n => normTeam(n) === normTeam(OUR_TEAM);
+const cleanVenue = v => String(v || '').replace(/\s+-\s+.*$/, '').trim();
+// Ergänzt Spiele aus SpielerPlus mit Gegner, Ort und Zeit aus dem Verbands-Spielplan (nur leere Felder).
+function mergeFixtures() {
+  for (const e of st.data.events) {
+    if (e.kind !== 'spiel') continue;
+    const fx = (st.data.fixtures || []).find(f => f.date === e.date && (isUs(f.home) || isUs(f.away)));
+    e._fx = fx || null; e._auto = [];
+    if (!fx) continue;
+    const home = isUs(fx.home);
+    if (!e.opponent) { e.opponent = home ? fx.away : fx.home; e._auto.push('Gegner'); }
+    if (!e.home_away) { e.home_away = home ? 'heim' : 'auswaerts'; e._auto.push('Heim/Auswärts'); }
+    if (!e.venue && fx.venue) { e.venue = cleanVenue(fx.venue); e._auto.push('Ort'); }
+    if (!e.time_start && fx.time) { e.time_start = fx.time; e._auto.push('Anpfiff'); }
+  }
+}
+const teamResults = team => (st.data.results || []).filter(r => normTeam(r.home) === normTeam(team) || normTeam(r.away) === normTeam(team))
+  .sort((a, b) => b.date.localeCompare(a.date));
+function outcome(r, team) {
+  const h = normTeam(r.home) === normTeam(team);
+  const f = h ? r.home_goals : r.away_goals, a = h ? r.away_goals : r.home_goals;
+  return { f, a, res: f > a ? 'S' : f < a ? 'N' : 'U', opp: h ? r.away : r.home, home: h };
+}
+const ourResult = game => (st.data.results || []).find(r => r.date === game.date && (isUs(r.home) || isUs(r.away)));
+const FORM_DE = { W: 'S', D: 'U', L: 'N' };
+const formChips = letters => `<span class="form">${[...letters].map(c => `<span class="fc fc-${FORM_DE[c] || c}" title="${{ S: 'Sieg', U: 'Unentschieden', N: 'Niederlage' }[FORM_DE[c] || c] || ''}">${FORM_DE[c] || c}</span>`).join('')}</span>`;
+const resLine = (r, team) => {
+  const o = outcome(r, team);
+  return `<li><span class="fc fc-${o.res}">${o.res}</span> <span class="muted small">${esc(fmtDate(r.date, false))}</span> ${o.home ? '' : '@ '}${esc(o.opp)} <strong>${o.f}:${o.a}</strong></li>`;
+};
+function leagueHtml(game) {
+  const lt = (st.data.league_table || []).find(x => x.group_name === LEAGUE_GROUP);
+  const rows = lt?.rows || [];
+  const opp = game.opponent;
+  const oppRow = rows.find(r => normTeam(r.team) === normTeam(opp));
+  const oppRes = opp ? teamResults(opp).filter(r => !(r.date === game.date && (isUs(r.home) || isUs(r.away)))).slice(0, 5) : [];
+  const h2h = opp ? teamResults(OUR_TEAM).filter(r => normTeam(r.home) === normTeam(opp) || normTeam(r.away) === normTeam(opp)) : [];
+  const next = (st.data.fixtures || []).filter(f => f.date >= todayIso() && (isUs(f.home) || isUs(f.away))).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 3);
+  const log = [...(st.data.sync_log || [])].sort((a, b) => (b.ran_at || '').localeCompare(a.ran_at || ''))[0];
+  if (!rows.length && !oppRes.length && !h2h.length && !next.length) return '';
+  return `
+    <section class="section league">
+      <div class="league-grid">
+        ${rows.length ? `<div class="panel">
+          <h3>Tabelle ${esc(LEAGUE_GROUP)}</h3>
+          <div class="table-wrap"><table class="lt">
+            <thead><tr><th>#</th><th>Team</th><th class="num">Sp</th><th class="num">Diff</th><th class="num">Pkt</th><th>Form</th></tr></thead>
+            <tbody>${rows.map(r => `<tr class="${isUs(r.team) ? 'us' : normTeam(r.team) === normTeam(opp) ? 'opp' : ''}">
+              <td>${r.rank}</td><td>${esc(r.team)}</td><td class="num">${r.sp}</td><td class="num">${r.diff > 0 ? '+' : ''}${r.diff}</td><td class="num"><strong>${r.pkt}</strong></td><td>${formChips(r.form || '')}</td></tr>`).join('')}</tbody>
+          </table></div>
+        </div>` : ''}
+        <div class="panel opp-panel">
+          ${opp ? `<h3>Gegner: ${esc(opp)}</h3>
+          ${oppRow ? `<p class="opp-rank"><strong>${oppRow.rank}.</strong> mit ${oppRow.pkt} Punkten, Tore ${oppRow.t}:${oppRow.gt} ${oppRow.form ? formChips(oppRow.form) : ''}</p>` : ''}
+          <h4>Letzte Resultate</h4>
+          ${oppRes.length ? `<ul class="res">${oppRes.map(r => resLine(r, opp)).join('')}</ul>` : '<p class="small muted">Noch keine gespeichert. Sie sammeln sich mit jedem Abruf.</p>'}
+          <h4>Direktvergleich</h4>
+          ${h2h.length ? `<ul class="res">${h2h.map(r => resLine(r, OUR_TEAM)).join('')}</ul>` : '<p class="small muted">Noch keine Duelle gespeichert.</p>'}`
+          : '<p class="muted">Gegner noch nicht bekannt.</p>'}
+          ${next.length ? `<h4>Nächste Spiele laut Verband</h4><ul class="res">${next.map(f => `<li><span class="muted small">${esc(fmtDate(f.date, true, false))}${f.time ? ' ' + esc(fmtTime(f.time)) : ''}</span> ${isUs(f.home) ? 'gegen' : '@'} ${esc(isUs(f.home) ? f.away : f.home)}${f.status && !/noch nicht ausgetragen/i.test(f.status) ? ` <span class="badge warn">${esc(f.status)}</span>` : ''}</li>`).join('')}</ul>` : ''}
+        </div>
+      </div>
+      ${log ? `<p class="small ${log.ok ? 'muted' : 'error'}">${log.ok ? 'Liga-Daten' : 'Letzter Abruf mit Problemen'}: Stand ${esc(fmtStamp(log.ran_at))}${log.ok ? '' : ` (${esc(log.message)})`}. Quellen: IFV-Spielplan, footstats.ch.</p>` : ''}
+    </section>`;
+}
+
+/* ---------- Spielplan-Import von Hand (ICS oder CSV vom IFV) ---------- */
+function parseIcsClient(text) {
+  const lines = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '').split('\n');
+  const out = []; let ev = null;
+  const un = v => v.replace(/\\n/gi, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';');
+  for (const line of lines) {
+    if (line === 'BEGIN:VEVENT') { ev = {}; continue; }
+    if (line === 'END:VEVENT') { if (ev) out.push(ev); ev = null; continue; }
+    if (!ev) continue;
+    const i = line.indexOf(':'); if (i < 0) continue;
+    ev[line.slice(0, i).split(';')[0].toUpperCase()] = un(line.slice(i + 1));
+  }
+  return out.map(e => {
+    const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/.exec(e.DTSTART || '');
+    if (!m) return null;
+    const [home, away] = (e.SUMMARY || '').split(/\s+-\s+/).map(t => t.replace(/\s*\(\d+\.?\)\s*$/, '').trim());
+    const desc = (e.DESCRIPTION || '').split('\n').map(x => x.trim()).filter(Boolean);
+    const nr = (desc.join(' ').match(/Spielnummer\s+(\d+)/) || [])[1] || (e.UID || '').split('@')[0];
+    const idx = desc.findIndex(x => /^Spielnummer/.test(x));
+    const status = idx >= 0 && desc[idx + 1] && !/^https?:/.test(desc[idx + 1]) ? desc[idx + 1] : '';
+    return { match_no: String(nr), date: `${m[1]}-${m[2]}-${m[3]}`, time: `${m[4]}:${m[5]}` === '00:00' ? '' : `${m[4]}:${m[5]}:00`,
+      home: home || '', away: away || '', venue: (e.LOCATION || '').trim(), status, competition: desc.slice(0, 2).join(' ').replace(/\s+/g, ' ') };
+  }).filter(Boolean);
+}
+function parseIfvCsv(rows) {
+  return rows.filter(r => r.Spielnummer && r.Spieldatum).map(r => ({
+    match_no: r.Spielnummer, date: spDate(r.Spieldatum), time: r.Spielzeit ? r.Spielzeit.slice(0, 5) + ':00' : '',
+    home: r['Teamname A'] || '', away: r['Teamname B'] || '', venue: r.Spielort || '', status: '', competition: `${r.SpielTyp || ''} ${r.Bezeichnung || ''}`.replace(/\s+/g, ' ').trim()
+  })).filter(r => r.date);
+}
+async function readText(file) {
+  const buf = await file.arrayBuffer();
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch { return new TextDecoder('windows-1252').decode(buf); }
+}
+
+function draftFromPrevious(game) {
+  const prev = previousLineup(game);
+  const d = newDraft(game, prev.lineup);
+  const avail = new Set(signedUp(game.id).map(p => p.id));
+  const removed = [];
+  d.data.slots = (d.data.slots || []).map(id => { if (id && !avail.has(id)) { removed.push(id); return null; } return id; });
+  d.data.bench = (d.data.bench || []).filter(id => { if (!avail.has(id)) { removed.push(id); return false; } return true; });
+  d.data.extra = [];
+  d.data.final = false;
+  d.title = `Aufstellung ${userName(st.user.id, st.user.email)}`;
+  return { d, removed: removed.map(id => st.pmap.get(id)).filter(Boolean) };
 }
 
 function newDraft(game, base) {
   return {
     id: null, event_id: game.id,
-    title: base ? `${base.title} (Kopie)` : `Aufstellung ${userName(st.user.id, st.user.email)}`,
-    data: base ? clone(base.data) : { formation: DEFAULT_FORMATION, slots: Array(11).fill(null), bench: [], extra: [] }
+    title: base ? `${base.title} – Variante` : `Aufstellung ${userName(st.user.id, st.user.email)}`,
+    data: base ? { ...clone(base.data), final: false } : { formation: DEFAULT_FORMATION, slots: Array(11).fill(null), bench: [], extra: [], final: false }
   };
 }
 function normalizeDraft(d) {
@@ -738,9 +1041,11 @@ function editorHtml() {
       <select class="select" data-on="formation" aria-label="Formation">${Object.keys(FORMATIONS).map(k =>
         `<option ${k === d.formation ? 'selected' : ''}>${k}</option>`).join('')}</select>
       <button class="btn" data-act="export">Bild exportieren</button>
+      <button class="btn ${d.final ? 'final-on' : ''}" data-act="toggle-final" title="Markiert diese Aufstellung als die gültige für das Spiel">${d.final ? '✓ Definitiv' : 'Als definitiv markieren'}</button>
       <button class="btn primary" data-act="save" ${st.dirty ? '' : 'disabled'}>${st.dirty ? 'Speichern' : 'Gespeichert'}</button>
     </div>
     <div class="small muted" style="margin:-.4rem 0 .8rem">${esc(fmtDate(game.date))}${game.opponent ? ' gegen ' + esc(game.opponent) : ''}. ${filled}/11 auf dem Feld, ${bench.length} auf der Bank.</div>
+    ${warningsHtml(gameWarnings(game, d))}
     <div class="ed-body">
       <div>
         <div class="hint ${hintActive ? 'active' : ''}">${hint}</div>
@@ -1294,9 +1599,13 @@ const TYPE_MAP = { training: 'training', game: 'spiel', tournament: 'spiel', eve
 
 async function handleFiles(files) {
   const evMap = new Map(); const problems = [];
+  const fixtures = [];
   for (const file of files) {
-    let rows;
-    try { rows = parseCsv(await file.text()); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    let rows, text;
+    try { text = await readText(file); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    if (/^\uFEFF?BEGIN:VCALENDAR/.test(text)) { fixtures.push(...parseIcsClient(text)); continue; }
+    try { rows = parseCsv(text); } catch { problems.push(`${file.name}: konnte nicht gelesen werden.`); continue; }
+    if (rows.length && 'Spielnummer' in rows[0] && 'Teamname A' in rows[0]) { fixtures.push(...parseIfvCsv(rows)); continue; }
     const stats = rows.length && 'user_participation' in rows[0];
     if (!rows.length || !('user_id' in rows[0]) || !('event_date_start' in rows[0])) {
       problems.push(`${file.name}: sieht nicht wie ein Export aus SpielerPlus aus.`); continue;
@@ -1318,6 +1627,12 @@ async function handleFiles(files) {
         status: stats ? (STATUS_MAP[r.user_participation] || 'none') : 'yes'
       });
     }
+  }
+  if (fixtures.length) {
+    await api.upsertFixtures(fixtures.map(f => ({ ...f, updated_at: new Date().toISOString() })));
+    await reload();
+    toast(`${fixtures.length} Spiele aus dem Verbands-Spielplan übernommen.`);
+    if (!evMap.size && !problems.length) { st.preview = null; renderView(); return; }
   }
   const events = [...evMap.values()].sort((a, b) => a.date.localeCompare(b.date));
   st.preview = { events, problems };
@@ -1375,9 +1690,9 @@ function importHtml() {
   return `
     <h2 style="margin-bottom:.75rem">CSV aus SpielerPlus importieren</h2>
     <label class="drop" data-drop="files">
-      <strong>CSV-Dateien hier ablegen oder auswählen</strong>
-      <span class="small muted">Termin-Export (wöchentlich) oder Statistik-Export (gelegentlich, mit Absagen). Mehrere Dateien gehen auch. Ein bereits importierter Termin wird mit dem neuen Stand ersetzt; von Hand gesetzte Häkchen bleiben erhalten.</span>
-      <input type="file" accept=".csv,text/csv" multiple data-on="files" style="position:absolute;opacity:0;width:1px;height:1px">
+      <strong>Dateien hier ablegen oder auswählen</strong>
+      <span class="small muted">SpielerPlus: Termin-Export (wöchentlich) oder Statistik-Export (gelegentlich, mit Absagen). Verband: Spielplan als Kalender (.ics) oder CSV, falls der automatische Abruf mal nicht klappt. Mehrere Dateien gehen auch. Ein bereits importierter Termin wird mit dem neuen Stand ersetzt; von Hand gesetzte Häkchen bleiben erhalten.</span>
+      <input type="file" accept=".csv,text/csv,.ics,text/calendar" multiple data-on="files" style="position:absolute;opacity:0;width:1px;height:1px">
     </label>
     ${pv ? `<div class="section">
       ${pv.problems.map(p => `<p class="error">${esc(p)}</p>`).join('')}
@@ -1474,10 +1789,22 @@ const actions = {
     await api.deleteLineup(st.draft.id); st.dirty = false; st.draft = null; await reload(); renderView(); toast('Aufstellung gelöscht.');
   },
   back() { if (leaveDraft()) renderView(); },
+  'toggle-final'() { st.draft.data.final = !st.draft.data.final; st.dirty = true; renderView(); },
+  'game-info'() { setDlgKind('', ''); gameInfoDialog(); },
+  'from-prev'() {
+    const { d, removed } = draftFromPrevious(eventById(st.gameId));
+    openDraft(d);
+    toast(removed.length ? `Übernommen. Nicht zugesagt und entfernt: ${removed.map(shortName).join(', ')}.` : 'Letzte Aufstellung übernommen.');
+  },
   async save(el) {
     el.disabled = true; el.textContent = 'Speichere …';
     const saved = await api.saveLineup(st.draft);
     st.draft.id = saved.id; st.dirty = false;
+    if (st.draft.data.final) { // nur eine definitive Aufstellung pro Spiel
+      for (const l of st.data.lineups.filter(x => x.event_id === st.draft.event_id && x.id !== saved.id && x.data?.final)) {
+        await api.saveLineup({ ...l, data: { ...l.data, final: false } });
+      }
+    }
     await reload();
     renderView(); toast('Aufstellung gespeichert.');
   },
@@ -1675,6 +2002,17 @@ document.addEventListener('submit', e => {
       else toast('Gespeichert.');
       renderView();
     });
+  } else if (f.dataset.form === 'game') {
+    e.preventDefault();
+    guarded(async () => {
+      const fd = new FormData(f);
+      const tm = v => (v ? String(v).slice(0, 5) + ':00' : '');
+      await api.updateEvent(st.gameId, {
+        opponent: String(fd.get('opponent') || '').trim(), home_away: fd.get('home_away') || 'heim',
+        venue: String(fd.get('venue') || '').trim(), time_start: tm(fd.get('time_start')), time_meet: tm(fd.get('time_meet'))
+      });
+      await reload(); closeDialog(); renderView(); toast('Spielinfos gespeichert.');
+    });
   } else if (f.dataset.form === 'out') {
     e.preventDefault();
     guarded(async () => {
@@ -1720,6 +2058,7 @@ document.addEventListener('submit', e => {
       .catch(err => { fail(err.message); b.disabled = false; });
   }
 });
+document.addEventListener('toggle', e => { if (e.target.matches?.('details.ifv')) lsSet('ifvOpen', e.target.open); }, true);
 dlg().addEventListener('close', () => { dlg().dataset.kind = ''; if (st.data) renderView(); });
 
 // Drag & Drop (Maus). Auf Touchgeräten: antippen und platzieren.
